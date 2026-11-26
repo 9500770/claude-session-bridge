@@ -226,7 +226,8 @@ def reconcile(dry):
 
 
 def entrypoint_of(jsonl):
-    """转录里每条记录都带 entrypoint：终端 CLI 是 `cli`，Desktop 引擎是 `claude-desktop-3p`。"""
+    """转录里每条记录都带 entrypoint：
+    终端交互 = `cli`，`claude -p` = `sdk-cli`，Desktop 引擎 = `claude-desktop-3p`。"""
     try:
         for i, line in enumerate(open(jsonl, errors="replace")):
             if i > 40:
@@ -247,7 +248,8 @@ def is_desktop_session(jsonl):
     优先看转录里的 entrypoint，读不到再退回 CLAUDE_CONFIG_DIR 判断。"""
     ep = entrypoint_of(jsonl) if jsonl else None
     if ep:
-        return not ep.startswith("cli")
+        # 实测取值：`cli`（终端交互）、`sdk-cli`（claude -p）、`claude-desktop-3p`（Desktop）
+        return ep.startswith("claude-desktop")
     cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if not cfg:
         return False
@@ -280,6 +282,9 @@ def main():
 
     if sid and jsonl and os.path.exists(jsonl):
         if "--end" in argv:
+            # SessionStart 触发时转录往往还没落盘，这里兜底补登记
+            if sid not in registered_cli_sessions():
+                register(sid, jsonl, dry)
             refresh(sid, jsonl)
         else:
             register(sid, jsonl, dry)
