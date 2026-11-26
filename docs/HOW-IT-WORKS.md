@@ -13,7 +13,7 @@
 
 ## 2. 登记文件的字段
 
-实测一条 Desktop 自建的 Code 会话记录（`local_07bb64e9-*.json`）有 25 个字段，关键几个：
+实测一条 Desktop 自建的 Code 会话记录（`local_07bb64e9-*.json`）有 18 个字段，关键几个：
 
 ```json
 {
@@ -21,13 +21,20 @@
   "cliSessionId": "7a6442ff-…",        // ★ 指向真实转录的 session id
   "title": "随意闲聊",                  // 侧边栏显示的标题
   "cwd": "/Users/gm/workspace/shdlh",  // 归属项目/workspace
+  "model": "sonnet-mm-2.5",            // 宿主侧的模型位（不是真实模型名，见 §11）
   "createdAt": 1795656000000,
   "lastActivityAt": 1795656000000,
-  "folderPlace": …,
-  "startedFromEnvironmentId": …,
-  "gitAnchors": …,
-  "turnBoxMounted": …,
-  "turnBoxDeclared": …
+  "permissionMode": …,
+  "originCwd": …,
+  "isArchived": …,
+  "enabledMcpTools": …,
+  "sessionPermissionUpdates": …,
+  "alwaysAllowedReasons": …,
+  "remoteMcpServersConfig": …,
+  "steeredByRemoteClient": …,
+  "interruptedAwaitingPerson": …,
+  "completedTurns": …,
+  "titleSource": …
 }
 ```
 
@@ -47,10 +54,12 @@ CLAUDE_CONFIG_DIR = /var/folders/36/.../T/claude-hostloop-plugins/<hash>
 --settings        = {"deniedMcpServers":[...]}     ← inline JSON，无 hooks
 ```
 
-- 那个 `CLAUDE_CONFIG_DIR` 实测是**空目录**，没有 `settings.json`
+- 那个 `CLAUDE_CONFIG_DIR` 实测是**空目录**，没有 `settings.json`（只有 plugins/projects/sessions 之类的运行时目录）
 - 全局 `~/.claude/settings.json` 里只放 `SessionStart/SessionEnd`，且 Desktop 的 `--settings` 不包含 hooks
 
 所以：Desktop 的会话不会执行本 hook；它只是被登记的对象。
+
+`--setting-sources user` 看着像会读 `~/.claude/settings.json`，但 `CLAUDE_CONFIG_DIR` 被改到临时目录后，「user 级配置」的落点也跟着换了目录 —— 这是它读不到你全局配置的根因。
 
 ## 4. hook 输入
 
@@ -107,18 +116,86 @@ real 0.03 / 0.02 / 0.02
 $ python3 -c "import json;print(json.loads(open(F).readline()).get('entrypoint'))"
 ```
 
-实测（同一台机器、同一 workspace）：
+实测（同一台机器、同一 workspace，2026-11-26）：
 
-| 会话 | entrypoint | 谁登记 |
+| 会话 | entrypoint | 处理 |
 |---|---|---|
-| `684974f1` | `claude-desktop-3p` | Desktop 自己 |
-| `7a6442ff` | `claude-desktop-3p` | Desktop 自己 |
-| `0f83f6f9` | `cli` | **需要本工具** |
-| `2dbe94b3` | `cli` | **需要本工具** |
-| `c24b684f` | `cli` | **需要本工具** |
+| `684974f1` | `claude-desktop-3p` | ⛔ Desktop 自己登记 |
+| `7a6442ff` | `claude-desktop-3p` | ⛔ Desktop 自己登记 |
+| `0f83f6f9` | `cli` | ✅ 需要本工具（终端交互） |
+| `2dbe94b3` | `cli` | ✅ 需要本工具（终端交互） |
+| `c24b684f` | `cli` | ✅ 需要本工具（终端交互） |
+| `4bc0adb2` | `sdk-cli` | ✅ 需要本工具（`claude -p` 也写这条） |
+
+守卫的实现是 **`entrypoint.startswith("claude-desktop")` 就跳过**，不是「只认 `cli`」。
+
+> 早期版本写的是「只认 `cli`」，结果 `claude -p`（`sdk-cli`）全被挡掉 —— 而 print 模式恰恰是脚本/CI 里最常用的调用方式。这是真机跑出来才发现的。
 
 `entrypoint` 不是每行都有，`csess-sync` 扫前 40 行取第一个非空值；取不到才退回
 `CLAUDE_CONFIG_DIR`（Desktop 引擎指向临时目录，CLI 用 `~/.claude`）。
 
 为什么不只靠去重：Desktop 的记录都带 `cliSessionId`，去重能挡掉大部分；
 但 Desktop 先开 hook 后写登记表时，去重来不及，就会多出一条重复条目。守卫在写之前，确定性更高。
+
+日志里守卫的样子：
+
+```
+2026-11-26 10:41:07 [40121] skip 684974f1: Desktop 会话（entrypoint=claude-desktop-3p），单向只同步 CLI
+2026-11-26 10:52:31 [40877] IN event=SessionStart sid=0f83f6f9 cwd=/Users/gm/workspace/shdlh dry=False
+2026-11-26 10:52:31 [40877] registered 0f83f6f9 -> local_c91ab08a-….json
+```
+
+## 10. 时序：SessionStart 往往还没有转录
+
+hook 在会话启动的瞬间被拉起，但 `claude` 是**先起进程、后写 jsonl**。实测 `SessionStart` 到达时
+`transcript_path` 指向的文件还不存在，脚本只能记一行 `skip …: 转录不存在`，等于没登记。
+
+修法：`SessionEnd` 也做一次登记（`csess-sync --end`）：
+
+```python
+if "--end" in argv:
+    # SessionStart 时转录往往还没落盘，这里兜底补登记
+    if sid not in registered_cli_sessions():
+        register(sid, jsonl, dry)
+    refresh(sid, jsonl)          # 轮数 / 标题 / lastActivityAt
+```
+
+所以两条 hook 都要装，缺哪条都会漏。副作用是 `--end` 会顺带跑 `reconcile`，清理逻辑见 §6。
+
+## 11. 为什么单向足够，以及 Desktop 的「模型位」去哪了
+
+**方向不对称的根源是共享目录。** 两份数据里转录是共享的（§1），只有登记表是 Desktop 私有的：
+
+- 终端 → Desktop：缺登记行 → **看不到**，需要本工具
+- Desktop → 终端：`claude --resume` 直接扫 `~/.claude/projects`，**本来就看得到**，不需要任何工具
+
+所以「双向同步」既无必要，又会给同一会话制造两条记录。
+
+**同一个隔离机制也解释了模型位。** `~/.claude/settings.json` 的 `env` 里配了：
+
+```json
+"ANTHROPIC_BASE_URL": "http://127.0.0.1:3425",
+"ANTHROPIC_DEFAULT_SONNET_MODEL": "zcode/GLM-5.4[1m]",
+"ANTHROPIC_DEFAULT_OPUS_MODEL":  "zcode/GLM-5.4[1m]",
+"ANTHROPIC_DEFAULT_HAIKU_MODEL": "zcode/GLM-5.4[1m]"
+```
+
+但 Desktop 拉起的 CLI 进程（实测 `ps eww` 读环境）是：
+
+```
+ANTHROPIC_BASE_URL          = http://127.0.0.1:3425     ← 继承了
+ANTHROPIC_AUTH_TOKEN        = ***                        ← 继承了（host auth）
+ANTHROPIC_DEFAULT_HAIKU_MODEL  = (空)
+ANTHROPIC_DEFAULT_SONNET_MODEL = (空)
+ANTHROPIC_DEFAULT_OPUS_MODEL   = (空)
+CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = 1                 ← ★ 声明 provider 由宿主管
+CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP = 1
+CLAUDE_CODE_MODEL_CATALOG = 0
+```
+
+即 Desktop **有意清空三个模型位**，模型改由界面选择器决定，选择结果落盘在登记记录的
+`model` 字段（例：`sonnet-mm-2.5`，这是宿主侧的模型位名，不是真实模型名）。
+
+结论：模型位在 Desktop 里不是「没配」，而是「不由 settings.json 配」。实际请求仍然走同一个网关——
+实测 Desktop 会话转录里的 `message.model` 是 `GLM-5.4`（CLI 会话是 `zcode/GLM-5.4`），说明路由后落到同一个后端，
+只是模型名由宿主在请求时改写。想在 Desktop 里换模型，改界面选择器或网关侧映射，而不是 `~/.claude/settings.json`。

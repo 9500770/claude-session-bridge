@@ -6,8 +6,10 @@
   csess-push --list            列出尚未登记的终端会话
   csess-push <session-id 前缀>  登记指定会话，如 csess-push 0f83f6f9
   csess-push <前缀> --dry       只看会写什么
+  csess-push <前缀> --force     连 Desktop 自己产生的会话也登记（默认跳过）
 
 原理与 csess-sync 相同：对话转录本来就共享，只是往 Desktop 的会话登记表里补一行。
+方向也相同：只 CLI → Desktop，Desktop 自己的会话默认不碰。
 """
 import glob
 import json
@@ -46,6 +48,28 @@ def registered():
         if sid:
             d[sid] = p
     return d
+
+
+def entrypoint_of(path, limit=40):
+    """转录里每条记录都带 entrypoint：`cli`（终端）、`sdk-cli`（claude -p）、`claude-desktop-3p`（Desktop）。"""
+    try:
+        for i, line in enumerate(open(path, errors="replace")):
+            if i > limit:
+                break
+            try:
+                ep = json.loads(line).get("entrypoint")
+            except Exception:
+                continue
+            if ep:
+                return ep
+    except Exception:
+        pass
+    return None
+
+
+def is_desktop_session(path):
+    ep = entrypoint_of(path)
+    return bool(ep) and ep.startswith("claude-desktop")
 
 
 def transcripts():
@@ -96,19 +120,26 @@ def summarize(path, limit=40):
 
 
 def main():
-    argv = [a for a in sys.argv[1:]]
-    dry = "--dry" in argv
-    argv = [a for a in argv if not a.startswith("--")]
+    raw_argv = sys.argv[1:]
+    dry = "--dry" in raw_argv
+    force = "--force" in raw_argv
+    argv = [a for a in raw_argv if not a.startswith("--")]
 
     reg = registered()
 
-    if "--list" in sys.argv or not argv:
+    if "--list" in raw_argv or not argv:
         log(f"{'STATUS':<8} {'SESSION':<10} {'TURNS':<6} TITLE")
+        skipped = 0
         for mt, sid, f in transcripts():
             if sid in reg:
                 continue
+            if not force and is_desktop_session(f):
+                skipped += 1
+                continue
             first, _, turns, _ = summarize(f)
             log(f"{'new':<8} {sid[:8]:<10} {turns:<6} {(first or '')[:60]}")
+        if skipped:
+            log(f"\n（另有 {skipped} 条 Desktop 自己产生的会话已跳过：单向只补 CLI，加 --force 可强制列出）")
         log("\n已登记的会话不在此列出。登记：csess-push <前缀>")
         return 0
 
@@ -123,6 +154,12 @@ def main():
     if sid in reg:
         log(f"{sid[:8]} 已在 Desktop 列表里：{os.path.basename(reg[sid])}")
         return 0
+
+    if not force and is_desktop_session(f):
+        ep = entrypoint_of(f)
+        log(f"{sid[:8]} 是 Desktop 自己产生的会话（entrypoint={ep}），它会自己登记；单向只补 CLI。")
+        log("确实要登记就加 --force。")
+        return 1
 
     tmpls = registry_files()
     if not tmpls:

@@ -20,17 +20,26 @@ $ ./install.sh
 
 ## 单向：只 CLI → Desktop
 
-本工具**只做一件事**：把终端 CLI 的会话补登记进 Desktop 列表。反方向不做，也不碰 Desktop 自己的会话。
+先分清两个方向，它们并不对称：
 
-判据用的是转录里每条记录都带的 `entrypoint` 字段：
-
-| 来源 | entrypoint |
+| 方向 | 现状 |
 |---|---|
-| 终端 `claude` | `cli` |
-| Desktop 引擎（Code 视图） | `claude-desktop-3p` |
+| Desktop 开的会话 → 终端 | ✅ **本来就能看到**。转录都在 `~/.claude/projects`，`claude --resume` 直接列得出来 |
+| 终端开的会话 → Desktop 侧边栏 | ❌ 看不到了，因为缺一行登记 |
 
-`csess-sync` 读到不是 `cli` 就退出 —— **Desktop 自己产生的会话不碰**（它本来就会登记），
-所以不会出现重复条目。（排查时想绕过，加 `--force`。）
+所以只需要补**一个方向**。反方向同步不但没必要，还会制造重复条目。
+
+本工具只做这一件事：把终端 CLI 的会话补登记进 Desktop 列表。判据是转录里每条记录都带的 `entrypoint` 字段：
+
+| 来源 | entrypoint | 处理 |
+|---|---|---|
+| 终端 `claude`（交互） | `cli` | ✅ 登记 |
+| `claude -p` / SDK | `sdk-cli` | ✅ 登记 |
+| Desktop Code 视图 / cowork | `claude-desktop-3p` | ⛔ 跳过（它自己会登记） |
+
+守卫是**只排除 `claude-desktop*`**，而不是「只认 `cli`」——后者会把 `claude -p` 全挡掉，实测踩过（见下方实测记录）。
+日志里能看到它干活：`skip 684974f1: Desktop 会话（entrypoint=claude-desktop-3p），单向只同步 CLI`。
+排查时想绕过加 `--force`。
 
 怎么装的也只有一个地方：`~/.claude/settings.json` 的两条 hook —— 也就是 CLI 的 hook。没有后台进程、没有 launchd、没有网络请求。
 
@@ -51,7 +60,7 @@ $ ./install.sh
      claude-code-sessions/<account>/<ws>/local_<uuid>.json
 ```
 
-登记文件只是一个 16 字段的 JSON，`cliSessionId` 指向真实的转录。工具用你机器上已存在的一条记录当模板，保证字段结构完全一致。
+登记文件只是一个 JSON，`cliSessionId` 指向真实的转录。工具用你机器上已存在的一条记录当模板，保证字段结构完全一致。
 
 ## 安装
 
@@ -81,16 +90,24 @@ curl -fsSL https://raw.githubusercontent.com/9500770/claude-session-bridge/main/
 tail -f ~/.csess/hook.log
 
 # 2. 在另一个终端跑一次 claude，随便问一句，然后看日志
-#    IN SessionStart session=xxxxxxxx cwd=/path   ← 出现就说明接上了
+#    IN event=SessionStart sid=xxxxxxxx cwd=/path   ← 出现就说明接上了
 
 # 3. 重启 Claude Desktop，侧边栏切到 Code 视图
+```
+
+不想开交互式会话时，最快的端到端自测（一条命令、几秒）：
+
+```bash
+claude -p "只回复 ok"
+tail -3 ~/.csess/hook.log        # 应看到 registered <sid> -> local_<uuid>.json
 ```
 
 补历史会话（hook 装之前开过的）：
 
 ```bash
-csess-push --list          # 列出尚未登记的会话
+csess-push --list          # 列出尚未登记的 CLI 会话（Desktop 自建的默认跳过）
 csess-push 0f83f6f9        # 登记指定会话（前缀匹配）
+csess-push 0f83f6f9 --dry  # 只看会写什么，不落盘
 ```
 
 ## hook 配置长什么样
@@ -107,6 +124,7 @@ csess-push 0f83f6f9        # 登记指定会话（前缀匹配）
 ```
 
 `SessionStart` 用 `async: true`（不阻塞你的第一次输入）；`SessionEnd` 同步但 timeout 15s（默认预算只有 1.5s，脚本实测 20–30ms 完成）。
+**两条都要**：`SessionStart` 触发时转录往往还没落盘，`SessionEnd` 负责兜底补登记（见实测记录）。
 
 ## 常见疑问
 
@@ -118,6 +136,11 @@ csess-push 0f83f6f9        # 登记指定会话（前缀匹配）
 不会。Desktop 用独立的 `CLAUDE_CONFIG_DIR`（`/var/folders/.../T/claude-hostloop-plugins/<hash>`）和 inline `--settings`，**不读 `~/.claude/settings.json`**，所以 Desktop 侧会话不会执行这个 hook；它只是被登记的对象。
 即便将来两边都执行，登记前按 `cliSessionId` 去重，同一会话只会有一行。
 
+**Q：那我配的 `ANTHROPIC_DEFAULT_*_MODEL` / 其他 `env` 在 Desktop 里怎么不生效？**
+同一个隔离机制。Desktop 拉起的 CLI 会继承 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`，但把 `ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL` **显式置空**，
+并用 `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` 声明 provider 由宿主代理；模型改由 Desktop 界面里的选择器决定，落盘在登记记录的 `model` 字段。
+实测：Desktop 会话转录里的 `message.model` 是路由后的真实模型名（本机 `GLM-5.4`），说明它走的是同一个网关，只是模型位不由 `~/.claude/settings.json` 给。
+
 **Q：同时开多个 CLI 会话会打架吗？**
 不会。每个会话的 hook 拿自己的 `session_id`，各写各的 `local_*.json`，文件名含随机 uuid，不会互相覆盖；读改写 `managed.json` 和清理动作都在 `~/.csess/lock` 的 `fcntl.flock` 里串行。
 
@@ -125,7 +148,19 @@ csess-push 0f83f6f9        # 登记指定会话（前缀匹配）
 只删**自己建的**、且**指向的转录已经消失**、且**存在超过 10 分钟**的记录（`--reconcile`）。你原有的记录一律不碰，记账在 `~/.csess/managed.json`。
 
 **Q：`/bin/zsh` 里 `claude: command not found`？**
-那是没装 CLI，跟本工具无关。本工具只在**有终端 `claude` 会话**时才有活干。确认：`which -a claude`。
+那是没装 CLI 或不在 PATH，跟本工具无关。本工具只在**有终端 `claude` 会话**时才有活干。确认：`which -a claude`。
+注意 npm 全局装在 `~/.npm-global/bin` 时，只有交互式 zsh 的 PATH 里有它。
+
+## 实测记录（2026-11-26，macOS 15.x / Claude Desktop 6.28899.6 / claude 2.1.332）
+
+真机跑出来的两个坑，都已修：
+
+1. **`SessionStart` 时转录还没落盘** —— hook 先触发、`claude` 后写 jsonl，脚本看到「转录不存在」直接跳过，等于没登记。
+   现在 `--end`（SessionEnd）会再查一次，没登记就补上。
+2. **`claude -p` 的 entrypoint 是 `sdk-cli`，不是 `cli`** —— 早期守卫写成「只认 `cli`」，print 模式（也是脚本、CI 里最常用的调用方式）全被挡掉。
+   守卫改成「只排除 `claude-desktop*`」。
+
+验证方式：`claude -p "只回复 ok"` → 日志出现 `registered 4bc0adb2 -> local_c91ab08a….json`。
 
 ## 卸载
 
@@ -144,7 +179,7 @@ csess-push 0f83f6f9        # 登记指定会话（前缀匹配）
 
 ## 原理细节
 
-见 [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md)：登记表字段、Desktop 引擎的启动参数、hook 输入样例、并发与清理规则。
+见 [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md)：登记表字段、Desktop 引擎的启动参数与环境隔离、hook 输入样例、并发与清理规则、entrypoint 实测表。
 
 ## License
 
