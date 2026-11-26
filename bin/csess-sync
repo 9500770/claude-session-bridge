@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""csess-sync — Claude Code hook: 把 CLI 会话自动登记进 Claude Desktop 列表
+
+由 ~/.claude/settings.json 的 SessionStart / SessionEnd 调用，读 stdin JSON。
+纯 harness 层：不调模型、不花 token、stdout 全部丢弃（避免注入上下文）。
+
+  csess-sync             SessionStart：登记当前 CLI 会话
+  csess-sync --end       SessionEnd：刷新轮数/标题 + 清理失效记录
+  csess-sync --reconcile 只清理
+  csess-sync --dry       只写日志不动文件（首跑观察）
+
+并发：注册与清理都在 ~/.csess/lock 排他锁内；多个 CLI 各用各的 session_id，
+      各写各的 local_*.json，互不覆盖。任何异常 exit 0。
+"""
+import json, os, sys, glob, time, uuid, traceback, fcntl, contextlib
+
+HOME = os.path.expanduser("~")
+REG_ROOT = os.path.join(HOME, "Library/Application Support/Claude-3p/claude-code-sessions")
+PROJ = os.path.join(HOME, ".claude/projects")
+STATE = os.path.join(HOME, ".csess")
+LOG = os.path.join(STATE, "hook.log")
+MANAGED = os.path.join(STATE, "managed.json")
+LOCK = os.path.join(STATE, "lock")
+PRUNE_MIN_AGE = 600  # 记录至少存在 10 分钟才允许判死，避免误删刚开的会话
+
+
+def log(msg):
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 256 * 1024:
+            os.replace(LOG, LOG + ".1")
+        with open(LOG, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{os.getpid()}] {msg}\n")
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def guard():
+    """排他锁：多 CLI 同时触发时串行化读改写。"""
+    os.makedirs(STATE, exist_ok=True)
+    f = open(LOCK, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        finally:
+            f.close()
+
+
+def load_managed():
+    try:
+        return json.load(open(MANAGED))
+    except Exception:
+        return {}
+
+
+def save_managed(d):
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        tmp = MANAGED + ".tmp"
+        json.dump(d, open(tmp, "w"), indent=1)
+        os.replace(tmp, MANAGED)
+    except Exception:
+        pass
+
+
+def registry_files():
+    out = []
+    for p in glob.glob(REG_ROOT + "/*/*/local_*.json"):
+        try:
+            out.append((os.path.getmtime(p), p))
+        except OSError:
+            pass
+    out.sort(reverse=True)
+    return out
+
+
+def record_of(path):
+    try:
+        return json.load(open(path))
+    except Exception:
+        return None
+
+
+def registered_cli_sessions():
+    m = {}
+    for _, p in registry_files():
+        r = record_of(p)
+        if r and r.get("cliSessionId"):
+            m[r["cliSessionId"]] = p
+    return m
+
+
+def transcript_of(sid):
+    hits = glob.glob(PROJ + "/*/" + sid + ".jsonl") + glob.glob(PROJ + "/" + sid + ".jsonl")
+    return hits[0] if hits else None
+
+
+def summarize(jsonl):
+    cwd, title, turns = None, None, 0
+    try:
+        for line in open(jsonl, errors="replace"):
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if cwd is None and d.get("cwd"):
+                cwd = d["cwd"]
+            if d.get("type") == "user" and not d.get("isMeta"):
+                turns += 1
+                if title is None:
+                    c = d.get("message", {}).get("content")
+                    if isinstance(c, str):
+                        t = c
+                    elif isinstance(c, list):
+                        t = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                    else:
+                        t = ""
+                    t = " ".join(t.split())
+                    if t and not t.startswith("<"):
+                        title = t[:60]
+    except Exception:
+        pass
+    return cwd, title, turns
+
+
+def build(sid, jsonl, tmpl):
+    cwd, title, turns = summarize(jsonl)
+    now = int(time.time() * 1000)
+    r = dict(tmpl)
+    r["sessionId"] = "local_" + str(uuid.uuid4())
+    r["cliSessionId"] = sid
+    r["cwd"] = cwd or tmpl.get("cwd") or HOME
+    r["title"] = title or "CLI session " + sid[:8]
+    r["completedTurns"] = turns
+    r["createdAt"] = now
+    r["updatedAt"] = now
+    r["permissionMode"] = tmpl.get("permissionMode") or "default"
+    return r
+
+
+def register(sid, jsonl, dry):
+    with guard():
+        reg = registered_cli_sessions()
+        if sid in reg:
+            log(f"skip {sid[:8]} 已登记: {os.path.basename(reg[sid])}")
+            return "already"
+        tmpls = registry_files()
+        if not tmpls:
+            log("skip: 无模板记录（Desktop 还没建过 Code 会话）")
+            return "no-template"
+        tpl_path = tmpls[0][1]
+        tmpl = record_of(tpl_path)
+        if not tmpl:
+            log("skip: 模板读取失败")
+            return "bad-template"
+        rec = build(sid, jsonl, tmpl)
+        out = os.path.join(os.path.dirname(tpl_path), rec["sessionId"] + ".json")
+        if dry:
+            log(f"DRY would write {os.path.basename(out)} title={rec['title']!r}")
+            return "dry"
+        tmp = out + ".tmp"
+        json.dump(rec, open(tmp, "w"), indent=2)
+        os.replace(tmp, out)
+        m = load_managed()
+        m[sid] = out
+        save_managed(m)
+        log(f"registered {sid[:8]} -> {os.path.basename(out)} title={rec['title']!r}")
+        return "created"
+
+
+def refresh(sid, jsonl):
+    with guard():
+        p = registered_cli_sessions().get(sid)
+        if not p:
+            log(f"end: {sid[:8]} 未登记，跳过")
+            return
+        r = record_of(p)
+        if not r:
+            return
+        cwd, title, turns = summarize(jsonl)
+        r["completedTurns"] = turns
+        if title and str(r.get("title") or "").startswith("CLI session "):
+            r["title"] = title
+        r["updatedAt"] = int(time.time() * 1000)
+        try:
+            tmp = p + ".tmp"
+            json.dump(r, open(tmp, "w"), indent=2)
+            os.replace(tmp, p)
+            log(f"end-update {sid[:8]} turns={turns}")
+        except Exception as e:
+            log(f"end-update 失败 {sid[:8]}: {e}")
+
+
+def reconcile(dry):
+    with guard():
+        m = load_managed()
+        for sid, path in list(m.items()):
+            if not os.path.exists(path):
+                m.pop(sid, None)
+                continue
+            if transcript_of(sid):
+                continue
+            try:
+                age = time.time() - os.path.getmtime(path)
+            except OSError:
+                continue
+            if age < PRUNE_MIN_AGE:
+                log(f"keep {sid[:8]} 转录缺失但记录只有 {int(age)}s，先不动")
+                continue
+            if dry:
+                log(f"DRY would prune {sid[:8]}")
+            else:
+                try:
+                    os.remove(path)
+                    log(f"pruned {sid[:8]} 转录已消失")
+                except Exception as e:
+                    log(f"prune 失败 {sid[:8]}: {e}")
+            m.pop(sid, None)
+        if not dry:
+            save_managed(m)
+
+
+def main():
+    argv = sys.argv[1:]
+    dry = "--dry" in argv
+    raw = ""
+    if not sys.stdin.isatty():
+        raw = sys.stdin.read()
+    ev = {}
+    if raw.strip():
+        try:
+            ev = json.loads(raw)
+        except Exception:
+            log("stdin 非 JSON: " + raw[:200])
+    sid = ev.get("session_id") or ev.get("sessionId")
+    jsonl = ev.get("transcript_path") or (transcript_of(sid) if sid else None)
+    event = ev.get("hook_event_name") or ""
+
+    log(f"IN event={event or '-'} sid={(sid or '-')[:8]} cwd={ev.get('cwd')} dry={dry}")
+
+    if sid and jsonl and os.path.exists(jsonl):
+        if "--end" in argv:
+            refresh(sid, jsonl)
+        else:
+            register(sid, jsonl, dry)
+    elif sid:
+        log(f"skip {sid[:8]}: 转录不存在 ({jsonl})")
+
+    if "--end" in argv or "--reconcile" in argv:
+        reconcile(dry)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        # hook 的 stdout 会被注入模型上下文（= 花 token），这里彻底掐断
+        sys.stdout = open(os.devnull, "w")
+        code = main()
+    except Exception:
+        log("FATAL " + traceback.format_exc().replace("\n", " | "))
+        code = 0
+    sys.exit(0)
