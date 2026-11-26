@@ -23,6 +23,8 @@ LOG = os.path.join(STATE, "hook.log")
 MANAGED = os.path.join(STATE, "managed.json")
 LOCK = os.path.join(STATE, "lock")
 PRUNE_MIN_AGE = 600  # 记录至少存在 10 分钟才允许判死，避免误删刚开的会话
+# 等转录落盘的轮数（每轮 0.2s）。测试里设 0，免得空转 8 秒。
+WAIT_STEPS = int(os.environ.get("CSESS_SYNC_WAIT_STEPS", "40"))
 
 
 def log(msg):
@@ -102,6 +104,8 @@ def transcript_of(sid):
 
 def summarize(jsonl):
     cwd, title, turns = None, None, 0
+    if not jsonl:
+        return cwd, title, turns
     try:
         for line in open(jsonl, errors="replace"):
             try:
@@ -128,22 +132,29 @@ def summarize(jsonl):
     return cwd, title, turns
 
 
-def build(sid, jsonl, tmpl):
+def build(sid, jsonl, tmpl, cwd_hint=None):
     cwd, title, turns = summarize(jsonl)
     now = int(time.time() * 1000)
     r = dict(tmpl)
+    real_cwd = cwd or cwd_hint or tmpl.get("cwd") or HOME
     r["sessionId"] = "local_" + str(uuid.uuid4())
     r["cliSessionId"] = sid
-    r["cwd"] = cwd or tmpl.get("cwd") or HOME
+    r["cwd"] = real_cwd
+    # 模板里的 folderPlace 属于别的目录，直接照抄会让会话落到"缺失文件夹"分组里
+    r["originCwd"] = real_cwd
+    r["folderPlace"] = {"cwd": real_cwd}
     r["title"] = title or "CLI session " + sid[:8]
     r["completedTurns"] = turns
     r["createdAt"] = now
     r["updatedAt"] = now
+    r["lastActivityAt"] = now
+    r["lastTurnEdgeAt"] = now
+    r["isArchived"] = False
     r["permissionMode"] = tmpl.get("permissionMode") or "default"
     return r
 
 
-def register(sid, jsonl, dry):
+def register(sid, jsonl, dry, cwd_hint=None):
     with guard():
         reg = registered_cli_sessions()
         if sid in reg:
@@ -158,7 +169,7 @@ def register(sid, jsonl, dry):
         if not tmpl:
             log("skip: 模板读取失败")
             return "bad-template"
-        rec = build(sid, jsonl, tmpl)
+        rec = build(sid, jsonl, tmpl, cwd_hint)
         out = os.path.join(os.path.dirname(tpl_path), rec["sessionId"] + ".json")
         if dry:
             log(f"DRY would write {os.path.basename(out)} title={rec['title']!r}")
@@ -171,6 +182,24 @@ def register(sid, jsonl, dry):
         save_managed(m)
         log(f"registered {sid[:8]} -> {os.path.basename(out)} title={rec['title']!r}")
         return "created"
+
+
+def drop_managed(sid):
+    """撤掉本工具建的那条登记。只动 managed.json 里记着的，Desktop 自己的记录不碰。"""
+    with guard():
+        p = load_managed().get(sid)
+        if not p:
+            return False
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            return False
+        m = load_managed()
+        if m.pop(sid, None) is not None:
+            save_managed(m)
+        log(f"drop {sid[:8]}: 撤掉本工具建的登记")
+        return True
 
 
 def refresh(sid, jsonl):
@@ -186,7 +215,10 @@ def refresh(sid, jsonl):
         r["completedTurns"] = turns
         if title and str(r.get("title") or "").startswith("CLI session "):
             r["title"] = title
-        r["updatedAt"] = int(time.time() * 1000)
+        now_ms = int(time.time() * 1000)
+        r["updatedAt"] = now_ms
+        r["lastActivityAt"] = now_ms
+        r["lastTurnEdgeAt"] = now_ms
         try:
             tmp = p + ".tmp"
             json.dump(r, open(tmp, "w"), indent=2)
@@ -259,6 +291,16 @@ def is_desktop_session(jsonl):
         return True
 
 
+def desktop_by_env():
+    """转录还没落盘时读不到 entrypoint，Desktop 会通过环境变量自报身份。"""
+    return (os.environ.get("CLAUDE_CODE_ENTRYPOINT") or "").startswith("claude-desktop")
+
+
+def env_entrypoint():
+    """hook 进程自己的 entrypoint；CLI 是 cli，Desktop / 跑批会自报别的值。"""
+    return os.environ.get("CLAUDE_CODE_ENTRYPOINT") or "cli"
+
+
 def main():
     argv = sys.argv[1:]
     dry = "--dry" in argv
@@ -280,7 +322,24 @@ def main():
 
     log(f"IN event={event or '-'} sid={(sid or '-')[:8]} cwd={ev.get('cwd')} dry={dry}")
 
-    if sid and jsonl and os.path.exists(jsonl):
+    have = bool(jsonl and os.path.exists(jsonl))
+    if sid and not have:
+        # SessionStart 通常早于转录落盘（实测延迟 5~8 秒）：等一轮，仍没有就用 cwd 兜底登记，
+        # 标题与轮数留给随后的 SessionStart / SessionEnd 补全。
+        for _ in range(WAIT_STEPS):
+            time.sleep(0.2)
+            if not jsonl:
+                jsonl = transcript_of(sid)
+            if jsonl and os.path.exists(jsonl):
+                have = True
+                break
+    if sid and have:
+        ep = entrypoint_of(jsonl)
+        if ep == "sdk-cli" and "--force" not in argv:
+            # 兜底登记时转录还没落盘、看不出是跑批；现在看清了，撤掉自己建的那条
+            drop_managed(sid)
+            log(f"skip {sid[:8]}: 非交互 (sdk-cli)，不进 Desktop 列表")
+            return 0
         if "--end" in argv:
             # SessionStart 触发时转录往往还没落盘，这里兜底补登记
             if sid not in registered_cli_sessions():
@@ -288,6 +347,9 @@ def main():
             refresh(sid, jsonl)
         else:
             register(sid, jsonl, dry)
+    elif sid and ev.get("cwd") and not desktop_by_env() and env_entrypoint() == "cli":
+        log(f"转录未落盘 {sid[:8]}，按 cwd 兜底登记 (title 稍后补)")
+        register(sid, None, dry, ev.get("cwd"))
     elif sid:
         log(f"skip {sid[:8]}: 转录不存在 ({jsonl})")
 

@@ -86,12 +86,13 @@ PY
 say ""
 say "自检（--dry，不写任何登记）："
 EV='{"session_id":"install-selftest-0000","transcript_path":"/nonexistent.jsonl","cwd":"'"$HOME"'","hook_event_name":"SessionStart"}'
-if OUT="$(printf '%s' "$EV" | "$HOOK_BIN" --dry 2>&1)"; then
+# CSESS_SYNC_WAIT_STEPS=0：自检的 transcript 永远不存在，别让它空等 8 秒
+if OUT="$(printf '%s' "$EV" | CSESS_SYNC_WAIT_STEPS=0 "$HOOK_BIN" --dry 2>&1)"; then
   say "✓ csess-sync 正常退出"
 else
   say "! csess-sync 退出异常，请看 ${HOME}/.csess/hook.log"
 fi
-BYTES="$(printf '%s' "$EV" | "$HOOK_BIN" | wc -c | tr -d ' ')"
+BYTES="$(printf '%s' "$EV" | CSESS_SYNC_WAIT_STEPS=0 "$HOOK_BIN" --dry | wc -c | tr -d ' ')"
 say "✓ stdout 字节数 = ${BYTES}（必须为 0，否则会污染模型上下文）"
 
 say ""

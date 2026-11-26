@@ -125,11 +125,12 @@ $ python3 -c "import json;print(json.loads(open(F).readline()).get('entrypoint')
 | `0f83f6f9` | `cli` | ✅ 需要本工具（终端交互） |
 | `2dbe94b3` | `cli` | ✅ 需要本工具（终端交互） |
 | `c24b684f` | `cli` | ✅ 需要本工具（终端交互） |
-| `4bc0adb2` | `sdk-cli` | ✅ 需要本工具（`claude -p` 也写这条） |
+| `4bc0adb2` | `sdk-cli` | ⛔ 跳过（`claude -p` 跑批，不是人开的会话） |
 
-守卫的实现是 **`entrypoint.startswith("claude-desktop")` 就跳过**，不是「只认 `cli`」。
+守卫是**黑名单**：`entrypoint` 以 `claude-desktop` 开头、或等于 `sdk-cli`，就跳过。
 
 > 早期版本写的是「只认 `cli`」，结果 `claude -p`（`sdk-cli`）全被挡掉 —— 而 print 模式恰恰是脚本/CI 里最常用的调用方式。这是真机跑出来才发现的。
+> 后来反过来：print 模式是脚本跑批，一天几十条塞进侧边栏纯噪音，于是显式跳过 `sdk-cli`（`--force` 仍可强登）。
 
 `entrypoint` 不是每行都有，`csess-sync` 扫前 40 行取第一个非空值；取不到才退回
 `CLAUDE_CONFIG_DIR`（Desktop 引擎指向临时目录，CLI 用 `~/.claude`）。
@@ -148,19 +149,56 @@ $ python3 -c "import json;print(json.loads(open(F).readline()).get('entrypoint')
 ## 10. 时序：SessionStart 往往还没有转录
 
 hook 在会话启动的瞬间被拉起，但 `claude` 是**先起进程、后写 jsonl**。实测 `SessionStart` 到达时
-`transcript_path` 指向的文件还不存在，脚本只能记一行 `skip …: 转录不存在`，等于没登记。
+`transcript_path` 指向的文件还不存在（延迟 5–8 秒），早期版本只记一行 `skip …: 转录不存在` 就退出。
 
-修法：`SessionEnd` 也做一次登记（`csess-sync --end`）：
+代价比看上去严重：**会话只要还开着就永远看不到**，因为 `SessionEnd` 要等退出才触发 ——
+越是「正在用的会话」越不在侧边栏里。
+
+现在是三级处理：
+
+1. 有转录 → 直接登记。
+2. 没转录 → 轮询等最多 8 秒（40 × 0.2s，测试里用 `CSESS_SYNC_WAIT_STEPS=0` 关掉），等到就正常登记。
+3. 还是没等到 → 用 hook 带来的 `cwd` **兜底登记**：标题先写 `CLI session <sid 前 8 位>`，
+   轮数与标题留给随后的 `SessionStart` / `SessionEnd` 补全。
 
 ```python
-if "--end" in argv:
-    # SessionStart 时转录往往还没落盘，这里兜底补登记
-    if sid not in registered_cli_sessions():
-        register(sid, jsonl, dry)
-    refresh(sid, jsonl)          # 轮数 / 标题 / lastActivityAt
+have = bool(jsonl and os.path.exists(jsonl))
+if sid and not have:
+    for _ in range(WAIT_STEPS):          # 每轮 0.2s
+        time.sleep(0.2)
+        ...                              # 补找 transcript_path / 按 sid 前缀找
+if sid and have:                         # 正常路径：登记 + 刷新
+    ...
+elif sid and ev.get("cwd") and not desktop_by_env():
+    register(sid, None, dry, ev.get("cwd"))   # 兜底登记
 ```
 
-所以两条 hook 都要装，缺哪条都会漏。副作用是 `--end` 会顺带跑 `reconcile`，清理逻辑见 §6。
+兜底分支必须先挡掉 Desktop：转录没落盘就读不到 `entrypoint`，这时看环境变量
+`CLAUDE_CODE_ENTRYPOINT`（Desktop 侧是 `claude-desktop*`），否则会把 Desktop 自建会话反向登记成重复条目。
+
+兜底登记的代价是**那一刻还看不出会话类型**（转录没落盘，读不到 `entrypoint`）。所以补了一条自愈：
+等 `SessionEnd` 读到 `entrypoint=sdk-cli`，把本工具建的那条撤掉 —— `drop_managed()` 只动
+`~/.csess/managed.json` 里记着自己的记录，Desktop 自建的记录一律不碰。日志：`drop 7a6442ff: 撤掉本工具建的登记`。
+
+`SessionEnd` 仍然做兜底登记 + 刷新（`csess-sync --end`），两条 hook 都要装，缺哪条都会漏。
+副作用是 `--end` 会顺带跑 `reconcile`，清理逻辑见 §6。
+
+## 10.1 模板里的 folderPlace 不能照抄
+
+登记记录靠「拿一条已有记录当模板」保证 schema 一致，但 `cwd` / `originCwd` / `folderPlace`
+是**属于那条记录的目录的**。照抄的后果：新会话被塞进模板会话的目录；那个目录不存在的机器上，
+侧边栏会把它归到「缺失文件夹」分组里（记录里 `lost: true`）。
+
+修法：`build()` 按真实 `cwd` 重建这三个字段。
+
+```python
+real_cwd = cwd or cwd_hint or tmpl.get("cwd") or HOME
+r["cwd"] = real_cwd
+r["originCwd"] = real_cwd
+r["folderPlace"] = {"cwd": real_cwd}
+```
+
+真机上还遇到过「模板文件夹存在但 `lost: true` 残留」的历史记录，用同样的判据就地修回即可。
 
 ## 11. 为什么单向足够，以及 Desktop 的「模型位」去哪了
 

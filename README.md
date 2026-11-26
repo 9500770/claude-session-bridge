@@ -34,12 +34,13 @@ $ ./install.sh
 | 来源 | entrypoint | 处理 |
 |---|---|---|
 | 终端 `claude`（交互） | `cli` | ✅ 登记 |
-| `claude -p` / SDK | `sdk-cli` | ✅ 登记 |
+| `claude -p` / SDK | `sdk-cli` | ⛔ 跳过（脚本跑批，不是人开的会话） |
 | Desktop Code 视图 / cowork | `claude-desktop-3p` | ⛔ 跳过（它自己会登记） |
 
-守卫是**只排除 `claude-desktop*`**，而不是「只认 `cli`」——后者会把 `claude -p` 全挡掉，实测踩过（见下方实测记录）。
+守卫是**黑名单**（`claude-desktop*` + `sdk-cli`），而不是「只认 `cli`」——后者会把别的交互式入口一起挡掉，实测踩过（见下方实测记录）。
 日志里能看到它干活：`skip 684974f1: Desktop 会话（entrypoint=claude-desktop-3p），单向只同步 CLI`。
-排查时想绕过加 `--force`。
+`claude -p` 一律跳过：那是脚本 / CI 跑批，不是人坐在那儿的会话，塞进侧边栏只是噪音（确实要收就加 `--force`）。
+上表是 **hook 自动登记**的判据；`csess-push` 是你手动补历史用的，`--list` 里仍然会列出 `sdk-cli`（要登记哪条由你点）。
 
 怎么装的也只有一个地方：`~/.claude/settings.json` 的两条 hook —— 也就是 CLI 的 hook。没有后台进程、没有 launchd、没有网络请求。
 
@@ -120,6 +121,13 @@ python3 tests/test_push_gate.py
 
 覆盖四条：`--list` 过滤 Desktop 会话、登记 Desktop 会话被拒、`--force` 放行、CLI 会话正常登记。
 
+```
+python3 tests/test_sync_fallback.py
+```
+
+覆盖 hook 主体的判定：转录未落盘时按 `cwd` 兜底登记、`folderPlace`/`originCwd` 按真实 `cwd` 重建（不进「缺失文件夹」分组）、`sdk-cli` 与 Desktop 会话不登记、`SessionEnd` 补全标题与轮数。
+两个测试都只写临时 `HOME`，不碰真实登记表。
+
 ## hook 配置长什么样
 
 ```json
@@ -134,7 +142,8 @@ python3 tests/test_push_gate.py
 ```
 
 `SessionStart` 用 `async: true`（不阻塞你的第一次输入）；`SessionEnd` 同步但 timeout 15s（默认预算只有 1.5s，脚本实测 20–30ms 完成）。
-**两条都要**：`SessionStart` 触发时转录往往还没落盘，`SessionEnd` 负责兜底补登记（见实测记录）。
+**两条都要**：`SessionStart` 触发时转录往往还没落盘（实测晚 5–8 秒），脚本会等最多 8 秒；仍没有就按 hook 带来的 `cwd` 兜底登记，标题和轮数留给 `SessionEnd` 补全（见实测记录）。
+等一下再没有是什么情况？比如会话刚开就被 kill。兜底登记保证「看得见」，`SessionEnd` 保证「标题对」。
 
 ## 常见疑问
 
@@ -170,7 +179,14 @@ python3 tests/test_push_gate.py
 2. **`claude -p` 的 entrypoint 是 `sdk-cli`，不是 `cli`** —— 早期守卫写成「只认 `cli`」，print 模式（也是脚本、CI 里最常用的调用方式）全被挡掉。
    守卫改成「只排除 `claude-desktop*`」。
 
+3. **只靠 `SessionEnd` 兜底不够** —— 会话只要还开着就不会触发 `SessionEnd`，于是**正在用的会话永远看不到**，越是想找它越不在。
+   现在 `SessionStart` 会轮询等转录（最多 8 秒），等不到就用 `cwd` 兜底登记：`转录未落盘 df8a0e2e，按 cwd 兜底登记 (title 稍后补)`。
+   兜底那一刻还看不出是跑批会话，等 `SessionEnd` 读到 `entrypoint=sdk-cli` 会把自己建的那条撤掉，不留垃圾。
+4. **登记记录照抄模板的 `folderPlace`** —— 模板是哪条会话的目录，新会话就被塞进哪个目录，目录不存在的话直接落到侧边栏的「缺失文件夹」分组里（记录里 `lost: true`）。
+   现在 `cwd` / `originCwd` / `folderPlace` 一律按 hook 传入的真实 `cwd` 重建。
+
 验证方式：`claude -p "只回复 ok"` → 日志出现 `registered 4bc0adb2 -> local_c91ab08a….json`。
+（`claude -p` 现在是跳过分支，端到端自测改用交互式 `claude` 开一句。）
 
 ## 卸载
 
