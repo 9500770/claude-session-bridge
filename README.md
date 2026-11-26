@@ -110,6 +110,16 @@ csess-push 0f83f6f9        # 登记指定会话（前缀匹配）
 csess-push 0f83f6f9 --dry  # 只看会写什么，不落盘
 ```
 
+## 测试
+
+不需要真机、不写真实登记表（在临时 HOME 里跑）：
+
+```
+python3 tests/test_push_gate.py
+```
+
+覆盖四条：`--list` 过滤 Desktop 会话、登记 Desktop 会话被拒、`--force` 放行、CLI 会话正常登记。
+
 ## hook 配置长什么样
 
 ```json
