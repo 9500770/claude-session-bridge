@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""csess-push — 手动把某个 CLI 会话补登记进 Claude Desktop 侧边栏
+
+（csess-sync 的 hook 装好之后一般用不到它；用于补历史会话、或 hook 没覆盖到的场景）
+
+  csess-push --list            列出尚未登记的终端会话
+  csess-push <session-id 前缀>  登记指定会话，如 csess-push 0f83f6f9
+  csess-push <前缀> --dry       只看会写什么
+
+原理与 csess-sync 相同：对话转录本来就共享，只是往 Desktop 的会话登记表里补一行。
+"""
+import glob
+import json
+import os
+import sys
+import uuid
+
+HOME = os.path.expanduser("~")
+REG_ROOT = os.path.join(HOME, "Library/Application Support/Claude-3p/claude-code-sessions")
+PROJ = os.path.join(HOME, ".claude/projects")
+
+
+def log(msg):
+    print(msg)
+
+
+def registry_files():
+    pats = [os.path.join(REG_ROOT, "*", "*", "local_*.json")]
+    out = []
+    for p in pats:
+        out += glob.glob(p)
+    out = [p for p in out if os.path.basename(p).startswith("local_")]
+    out.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return out
+
+
+def registered():
+    """cliSessionId -> 记录路径"""
+    d = {}
+    for p in registry_files():
+        try:
+            j = json.load(open(p))
+        except Exception:
+            continue
+        sid = j.get("cliSessionId")
+        if sid:
+            d[sid] = p
+    return d
+
+
+def transcripts():
+    out = []
+    for f in glob.glob(os.path.join(PROJ, "*", "*.jsonl")):
+        sid = os.path.basename(f)[:-6]
+        try:
+            out.append((os.path.getmtime(f), sid, f))
+        except OSError:
+            pass
+    out.sort(reverse=True)
+    return out
+
+
+def summarize(path, limit=40):
+    """取首条用户消息做标题、数轮数、拿 cwd"""
+    first, last, turns, cwd = None, None, 0, None
+    try:
+        for line in open(path, errors="replace"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if cwd is None and d.get("cwd"):
+                cwd = d["cwd"]
+            if d.get("type") != "user" or d.get("isSidechain"):
+                continue
+            c = d.get("message", {}).get("content")
+            text = None
+            if isinstance(c, str):
+                text = c
+            elif isinstance(c, list):
+                for part in c:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text = (text or "") + part.get("text", "")
+            if not text or text.lstrip().startswith("<"):
+                continue
+            text = " ".join(text.split())
+            turns += 1
+            first = first or text[:limit]
+            last = text[:limit]
+    except OSError:
+        pass
+    return first, last, turns, cwd
+
+
+def main():
+    argv = [a for a in sys.argv[1:]]
+    dry = "--dry" in argv
+    argv = [a for a in argv if not a.startswith("--")]
+
+    reg = registered()
+
+    if "--list" in sys.argv or not argv:
+        log(f"{'STATUS':<8} {'SESSION':<10} {'TURNS':<6} TITLE")
+        for mt, sid, f in transcripts():
+            if sid in reg:
+                continue
+            first, _, turns, _ = summarize(f)
+            log(f"{'new':<8} {sid[:8]:<10} {turns:<6} {(first or '')[:60]}")
+        log("\n已登记的会话不在此列出。登记：csess-push <前缀>")
+        return 0
+
+    prefix = argv[0]
+    hits = [(mt, sid, f) for mt, sid, f in transcripts() if sid.startswith(prefix)]
+    if not hits:
+        sys.exit(f"没找到以 {prefix} 开头的转录")
+    if len(hits) > 1:
+        sys.exit("前缀不唯一: " + ", ".join(h[1][:8] for h in hits))
+    mt, sid, f = hits[0]
+
+    if sid in reg:
+        log(f"{sid[:8]} 已在 Desktop 列表里：{os.path.basename(reg[sid])}")
+        return 0
+
+    tmpls = registry_files()
+    if not tmpls:
+        sys.exit("找不到模板记录：请先在 Desktop 的 Code 视图里建一个会话")
+    tpl = json.load(open(tmpls[0]))
+
+    first, last, turns, cwd = summarize(f)
+    now = int(__import__("time").time() * 1000)
+    new = dict(tpl)
+    new["sessionId"] = "local_" + str(uuid.uuid4())
+    new["cliSessionId"] = sid
+    new["title"] = (first or "CLI 会话")[:60]
+    new["cwd"] = cwd or tpl.get("cwd")
+    new["createdAt"] = now
+    new["lastActivityAt"] = now
+
+    out = os.path.join(os.path.dirname(tmpls[0]), new["sessionId"] + ".json")
+    log(f"session_id   = {new['sessionId']}")
+    log(f"cliSessionId = {sid}")
+    log(f"cwd          = {new['cwd']}")
+    log(f"title        = {new['title']}")
+    log(f"turns        = {turns}")
+    if dry:
+        log(f"\n--dry：未写入。将写入 {out}")
+        return 0
+    with open(out, "w") as fh:
+        json.dump(new, fh, ensure_ascii=False)
+    log(f"\n已写入 {out}")
+    log("重启 Claude Desktop 后应出现在侧边栏（Code 视图）。撤销：rm '" + out + "'")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
