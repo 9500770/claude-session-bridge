@@ -9,7 +9,7 @@
   csess-sync --reconcile 只清理
   csess-sync --dry       只写日志不动文件（首跑观察）
 
-单向：只把 CLI 会话登记进 Desktop；Desktop 侧触发的 hook 直接退出。
+单向：只把 CLI 会话（entrypoint=cli）登记进 Desktop；Desktop 自己产生的会话不碰。
 并发：注册与清理都在 ~/.csess/lock 排他锁内；多个 CLI 各用各的 session_id，
       各写各的 local_*.json，互不覆盖。任何异常 exit 0。
 """
@@ -225,9 +225,29 @@ def reconcile(dry):
             save_managed(m)
 
 
-def is_desktop_engine():
-    """Desktop 引擎会把 CLAUDE_CONFIG_DIR 指到临时目录，终端 CLI 用 ~/.claude。
-    单向同步：Desktop 侧触发的 hook 立刻退出，绝不把 Desktop 会话反过来登记。"""
+def entrypoint_of(jsonl):
+    """转录里每条记录都带 entrypoint：终端 CLI 是 `cli`，Desktop 引擎是 `claude-desktop-3p`。"""
+    try:
+        for i, line in enumerate(open(jsonl, errors="replace")):
+            if i > 40:
+                break
+            try:
+                ep = json.loads(line).get("entrypoint")
+            except Exception:
+                continue
+            if ep:
+                return ep
+    except Exception:
+        pass
+    return None
+
+
+def is_desktop_session(jsonl):
+    """单向同步：Desktop 自己产生的会话不参与（它自己会登记）。
+    优先看转录里的 entrypoint，读不到再退回 CLAUDE_CONFIG_DIR 判断。"""
+    ep = entrypoint_of(jsonl) if jsonl else None
+    if ep:
+        return not ep.startswith("cli")
     cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if not cfg:
         return False
@@ -240,9 +260,6 @@ def is_desktop_engine():
 def main():
     argv = sys.argv[1:]
     dry = "--dry" in argv
-    if is_desktop_engine() and "--force" not in argv:
-        log("skip: Desktop 引擎触发，单向模式只同步 CLI 会话")
-        return 0
     raw = ""
     if not sys.stdin.isatty():
         raw = sys.stdin.read()
@@ -255,6 +272,9 @@ def main():
     sid = ev.get("session_id") or ev.get("sessionId")
     jsonl = ev.get("transcript_path") or (transcript_of(sid) if sid else None)
     event = ev.get("hook_event_name") or ""
+    if "--force" not in argv and is_desktop_session(jsonl):
+        log(f"skip {str(sid)[:8]}: Desktop 会话（entrypoint={entrypoint_of(jsonl) if jsonl else '-'}），单向只同步 CLI")
+        return 0
 
     log(f"IN event={event or '-'} sid={(sid or '-')[:8]} cwd={ev.get('cwd')} dry={dry}")
 

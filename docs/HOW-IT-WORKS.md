@@ -99,20 +99,26 @@ real 0.03 / 0.02 / 0.02
 - **刷新时机**：新登记后必须重启 Desktop（或触发它重读登记表）才刷新
 - **跨机**：本工具不解决 MacBook ↔ Mac mini 的会话共享；那需要同步 `~/.claude/projects` 与登记表两处
 
-## 9. 单向守卫
+## 9. 单向守卫：靠 entrypoint 判来源
 
-目标只有 CLI → Desktop 一个方向，所以 `csess-sync` 第一件事是判来源：
+目标只有 CLI → Desktop 一个方向。判据不是猜环境变量，而是转录自己写的字段：
 
-```python
-def is_desktop_engine():
-    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
-    if not cfg:
-        return False
-    return os.path.realpath(cfg) != os.path.realpath("~/.claude")
+```
+$ python3 -c "import json;print(json.loads(open(F).readline()).get('entrypoint'))"
 ```
 
-Desktop 引擎启动参数带自己的 `CLAUDE_CONFIG_DIR`（临时目录），终端 CLI 则用 `~/.claude`。
-命中即 `return 0`，日志记一条 `skip: Desktop 引擎触发`。
+实测（同一台机器、同一 workspace）：
 
-为什么必须有这道闸：Desktop 建的会话大多已经带 `cliSessionId`，靠去重能挡掉一部分；
-但**没有 `cliSessionId` 的 Desktop 会话会被当成新会话登记一遍**，侧边栏就出现重复条目。守卫比去重更靠前，也更确定。
+| 会话 | entrypoint | 谁登记 |
+|---|---|---|
+| `684974f1` | `claude-desktop-3p` | Desktop 自己 |
+| `7a6442ff` | `claude-desktop-3p` | Desktop 自己 |
+| `0f83f6f9` | `cli` | **需要本工具** |
+| `2dbe94b3` | `cli` | **需要本工具** |
+| `c24b684f` | `cli` | **需要本工具** |
+
+`entrypoint` 不是每行都有，`csess-sync` 扫前 40 行取第一个非空值；取不到才退回
+`CLAUDE_CONFIG_DIR`（Desktop 引擎指向临时目录，CLI 用 `~/.claude`）。
+
+为什么不只靠去重：Desktop 的记录都带 `cliSessionId`，去重能挡掉大部分；
+但 Desktop 先开 hook 后写登记表时，去重来不及，就会多出一条重复条目。守卫在写之前，确定性更高。

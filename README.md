@@ -22,9 +22,15 @@ $ ./install.sh
 
 本工具**只做一件事**：把终端 CLI 的会话补登记进 Desktop 列表。反方向不做，也不碰 Desktop 自己的会话。
 
-Desktop 引擎会把 `CLAUDE_CONFIG_DIR` 指到临时目录，终端 CLI 用 `~/.claude`。`csess-sync` 开头就检查这个：
-**Desktop 侧触发的 hook 立刻退出**，所以不会出现「Desktop 会话被当成 CLI 会话再登记一遍」的重复条目。
-（排查时想让它在 Desktop 侧也跑，加 `--force`。）
+判据用的是转录里每条记录都带的 `entrypoint` 字段：
+
+| 来源 | entrypoint |
+|---|---|
+| 终端 `claude` | `cli` |
+| Desktop 引擎（Code 视图） | `claude-desktop-3p` |
+
+`csess-sync` 读到不是 `cli` 就退出 —— **Desktop 自己产生的会话不碰**（它本来就会登记），
+所以不会出现重复条目。（排查时想绕过，加 `--force`。）
 
 怎么装的也只有一个地方：`~/.claude/settings.json` 的两条 hook —— 也就是 CLI 的 hook。没有后台进程、没有 launchd、没有网络请求。
 
