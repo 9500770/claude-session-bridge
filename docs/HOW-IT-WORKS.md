@@ -98,3 +98,21 @@ real 0.03 / 0.02 / 0.02
 - **侧边栏视图模式**：日志里 `sidebar_mode: 'cowork'` 时，在 cowork 视图看不到 Code 会话，需要手动切到 Code 视图
 - **刷新时机**：新登记后必须重启 Desktop（或触发它重读登记表）才刷新
 - **跨机**：本工具不解决 MacBook ↔ Mac mini 的会话共享；那需要同步 `~/.claude/projects` 与登记表两处
+
+## 9. 单向守卫
+
+目标只有 CLI → Desktop 一个方向，所以 `csess-sync` 第一件事是判来源：
+
+```python
+def is_desktop_engine():
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not cfg:
+        return False
+    return os.path.realpath(cfg) != os.path.realpath("~/.claude")
+```
+
+Desktop 引擎启动参数带自己的 `CLAUDE_CONFIG_DIR`（临时目录），终端 CLI 则用 `~/.claude`。
+命中即 `return 0`，日志记一条 `skip: Desktop 引擎触发`。
+
+为什么必须有这道闸：Desktop 建的会话大多已经带 `cliSessionId`，靠去重能挡掉一部分；
+但**没有 `cliSessionId` 的 Desktop 会话会被当成新会话登记一遍**，侧边栏就出现重复条目。守卫比去重更靠前，也更确定。

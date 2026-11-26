@@ -18,6 +18,18 @@ $ ./install.sh
 
 ---
 
+## 单向：只 CLI → Desktop
+
+本工具**只做一件事**：把终端 CLI 的会话补登记进 Desktop 列表。反方向不做，也不碰 Desktop 自己的会话。
+
+Desktop 引擎会把 `CLAUDE_CONFIG_DIR` 指到临时目录，终端 CLI 用 `~/.claude`。`csess-sync` 开头就检查这个：
+**Desktop 侧触发的 hook 立刻退出**，所以不会出现「Desktop 会话被当成 CLI 会话再登记一遍」的重复条目。
+（排查时想让它在 Desktop 侧也跑，加 `--force`。）
+
+怎么装的也只有一个地方：`~/.claude/settings.json` 的两条 hook —— 也就是 CLI 的 hook。没有后台进程、没有 launchd、没有网络请求。
+
+---
+
 ## 它到底是什么
 
 一句话：**会话内容本来就是共享的，缺的只是一张对照表；本工具替 Desktop 把表里漏掉的那一行补上。**
@@ -89,34 +101,6 @@ csess-push 0f83f6f9        # 登记指定会话（前缀匹配）
 ```
 
 `SessionStart` 用 `async: true`（不阻塞你的第一次输入）；`SessionEnd` 同步但 timeout 15s（默认预算只有 1.5s，脚本实测 20–30ms 完成）。
-
-## 已验证
-
-macOS 27.2 / Python 3.12.4 上实测：
-
-| 操作 | 结果 |
-|---|---|
-| `./install.sh` 重复运行两次 | hooks 仍是 2 条，不重复追加 |
-| `./uninstall.sh` | `hooks: {}`，`~/bin` 下两个脚本已删 |
-| 卸载后再 `./install.sh` | 完整恢复，2 条 hook |
-| 自检 | 退出码 0，stdout = 0 字节 |
-| 单次执行耗时 | 20–30 ms（`SessionEnd` 默认预算 1.5 s，余量充足）|
-
-## 疑难
-
-**`git clone` 报 `RPC failed; curl 28` / `Error in the HTTP2 framing layer`**
-
-某些代理/VPN 下 GitHub 的 HTTP2 会断。加一条：
-
-```bash
-git -c http.version=HTTP/1.1 clone --depth 1 https://github.com/9500770/claude-session-bridge
-```
-
-或者干脆不用 git，走 `curl ... | bash` 那行。
-
-**装完 `tail -f ~/.csess/hook.log` 一直空**
-
-说明没有 CLI 会话在跑（hook 只在 `claude` 启动/结束时触发）。确认 `which -a claude` 有输出。
 
 ## 常见疑问
 

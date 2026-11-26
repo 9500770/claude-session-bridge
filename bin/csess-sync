@@ -9,6 +9,7 @@
   csess-sync --reconcile 只清理
   csess-sync --dry       只写日志不动文件（首跑观察）
 
+单向：只把 CLI 会话登记进 Desktop；Desktop 侧触发的 hook 直接退出。
 并发：注册与清理都在 ~/.csess/lock 排他锁内；多个 CLI 各用各的 session_id，
       各写各的 local_*.json，互不覆盖。任何异常 exit 0。
 """
@@ -224,9 +225,24 @@ def reconcile(dry):
             save_managed(m)
 
 
+def is_desktop_engine():
+    """Desktop 引擎会把 CLAUDE_CONFIG_DIR 指到临时目录，终端 CLI 用 ~/.claude。
+    单向同步：Desktop 侧触发的 hook 立刻退出，绝不把 Desktop 会话反过来登记。"""
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not cfg:
+        return False
+    try:
+        return os.path.realpath(cfg) != os.path.realpath(os.path.join(HOME, ".claude"))
+    except Exception:
+        return True
+
+
 def main():
     argv = sys.argv[1:]
     dry = "--dry" in argv
+    if is_desktop_engine() and "--force" not in argv:
+        log("skip: Desktop 引擎触发，单向模式只同步 CLI 会话")
+        return 0
     raw = ""
     if not sys.stdin.isatty():
         raw = sys.stdin.read()
