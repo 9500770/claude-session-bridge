@@ -90,6 +90,34 @@ csess-push 0f83f6f9        # 登记指定会话（前缀匹配）
 
 `SessionStart` 用 `async: true`（不阻塞你的第一次输入）；`SessionEnd` 同步但 timeout 15s（默认预算只有 1.5s，脚本实测 20–30ms 完成）。
 
+## 已验证
+
+macOS 27.2 / Python 3.12.4 上实测：
+
+| 操作 | 结果 |
+|---|---|
+| `./install.sh` 重复运行两次 | hooks 仍是 2 条，不重复追加 |
+| `./uninstall.sh` | `hooks: {}`，`~/bin` 下两个脚本已删 |
+| 卸载后再 `./install.sh` | 完整恢复，2 条 hook |
+| 自检 | 退出码 0，stdout = 0 字节 |
+| 单次执行耗时 | 20–30 ms（`SessionEnd` 默认预算 1.5 s，余量充足）|
+
+## 疑难
+
+**`git clone` 报 `RPC failed; curl 28` / `Error in the HTTP2 framing layer`**
+
+某些代理/VPN 下 GitHub 的 HTTP2 会断。加一条：
+
+```bash
+git -c http.version=HTTP/1.1 clone --depth 1 https://github.com/9500770/claude-session-bridge
+```
+
+或者干脆不用 git，走 `curl ... | bash` 那行。
+
+**装完 `tail -f ~/.csess/hook.log` 一直空**
+
+说明没有 CLI 会话在跑（hook 只在 `claude` 启动/结束时触发）。确认 `which -a claude` 有输出。
+
 ## 常见疑问
 
 **Q：花 token 吗？**
